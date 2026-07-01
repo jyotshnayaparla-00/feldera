@@ -31,7 +31,7 @@ Each GitHub page above has a **Download raw file** button. To fetch a file from 
 terminal, use its raw URL, e.g.:
 
 ```bash
-curl -O https://raw.githubusercontent.com/feldera/feldera/main/docs.feldera.com/docs/use_cases/medallion_architecture/push_changes.py
+curl -O 'https://raw.githubusercontent.com/feldera/feldera/main/docs.feldera.com/docs/use_cases/medallion_architecture/push_changes.py'
 ```
 :::
 

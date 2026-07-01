@@ -223,7 +223,7 @@ section below describes one way to generate these files.
    errors about an insecure connection (or self-signed certificates).
    For example, when using curl:
    ```
-   curl --cacert tls.crt https://localhost:8080/v0/pipelines
+   curl --cacert tls.crt 'https://localhost:8080/v0/pipelines'
    ```
 
    It is no longer possible to reach the endpoints via HTTP.

@@ -15,7 +15,7 @@ It allows you to create, manage, and monitor pipelines. It also features an inte
   <TabItem value="linux" label="Linux">
 
 ```bash
-curl -fsSL https://docs.feldera.com/install-fda | bash
+curl -fsSL 'https://docs.feldera.com/install-fda' | bash
 ```
 
 | Supported platforms |
@@ -29,7 +29,7 @@ Requires glibc >= 2.39 (Ubuntu 24.04+, Debian 13+, Fedora 40+, RHEL 10+).
   <TabItem value="macos" label="macOS">
 
 ```bash
-curl -fsSL https://docs.feldera.com/install-fda | bash
+curl -fsSL 'https://docs.feldera.com/install-fda' | bash
 ```
 
 | Supported platforms |
@@ -70,14 +70,14 @@ To install a specific version, pass the release git tag to the install script:
   <TabItem value="linux" label="Linux">
 
 ```bash
-curl -fsSL https://docs.feldera.com/install-fda | FDA_VERSION=v0.290.0 bash
+curl -fsSL 'https://docs.feldera.com/install-fda' | FDA_VERSION=v0.290.0 bash
 ```
 
   </TabItem>
   <TabItem value="macos" label="macOS">
 
 ```bash
-curl -fsSL https://docs.feldera.com/install-fda | FDA_VERSION=v0.290.0 bash
+curl -fsSL 'https://docs.feldera.com/install-fda' | FDA_VERSION=v0.290.0 bash
 ```
 
   </TabItem>
@@ -96,14 +96,14 @@ To install to a custom directory:
   <TabItem value="linux" label="Linux">
 
 ```bash
-curl -fsSL https://docs.feldera.com/install-fda | FDA_VERSION=v0.290.0 FELDERA_INSTALL=/opt/feldera bash
+curl -fsSL 'https://docs.feldera.com/install-fda' | FDA_VERSION=v0.290.0 FELDERA_INSTALL=/opt/feldera bash
 ```
 
   </TabItem>
   <TabItem value="macos" label="macOS">
 
 ```bash
-curl -fsSL https://docs.feldera.com/install-fda | FDA_VERSION=v0.290.0 FELDERA_INSTALL=/opt/feldera bash
+curl -fsSL 'https://docs.feldera.com/install-fda' | FDA_VERSION=v0.290.0 FELDERA_INSTALL=/opt/feldera bash
 ```
 
   </TabItem>
@@ -249,10 +249,10 @@ CREATE VIEW example_count AS ( SELECT COUNT(*) AS num_rows FROM example );" > pr
 fda create p1 program.sql
 ```
 
-Retrieve the program for `p1` and create a new pipeline `p2` from it:
+Copy pipeline `p1` to a new pipeline `p2`:
 
 ```bash
-fda program get p1 | fda create p2 -s
+fda copy p1 p2
 ```
 
 Enable storage for `p1`:

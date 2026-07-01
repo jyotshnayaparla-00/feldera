@@ -4,8 +4,9 @@ use crate::{Catalog, ControllerError, catalog::OutputCollectionHandles};
 use dbsp::circuit::Layout;
 use dbsp::circuit::circuit_builder::CircuitBase;
 use dbsp::dynamic::DynData;
+use dbsp::operator::dynamic::accumulator::EnableCount;
 use dbsp::trace::spine_async::WithSnapshot;
-use dbsp::typed_batch::TypedBatch;
+use dbsp::typed_batch::{Spine, TypedBatch};
 use dbsp::utils::Tup1;
 use dbsp::{Batch, Circuit as _, OrdZSet, Runtime};
 use dbsp::{
@@ -53,12 +54,34 @@ impl Catalog {
             .map(|pid| format!("{pid}.output"))
     }
 
+    /// Gather output stream (table or view) to the host that it is assigned to.
+    /// Returns the accumulated stream and, optionally, its integral.
+    ///
+    /// # Arguments
+    ///
+    /// * `shard` - whether to shard the stream in a single-host configuration, where no cross-node
+    ///   echange is needed. In the multihost configuration the output stream will be
+    ///   unconditionally sharded across all workers on the target host.
+    /// * `integrate` - whether to create an integral of the gathered stream.
+    ///
+    /// # Returns
+    ///
+    /// * Accumulated gathered stream
+    /// * The number of active consumers of the stream, which can be used with OutputCollectionHandles to
+    ///   enable the accumulator at runtime
+    /// * If `integrate` is `true`, the integral of the accumulated stream.
+    #[allow(clippy::type_complexity)]
     fn gather_output_to_host<Z>(
         &self,
         name: &SqlIdentifier,
         stream: &Stream<RootCircuit, Z>,
         shard: bool,
-    ) -> Stream<RootCircuit, Z>
+        integrate: bool,
+    ) -> (
+        Stream<RootCircuit, Option<Spine<Z>>>,
+        EnableCount,
+        Option<Stream<RootCircuit, Spine<Z>>>,
+    )
     where
         Z: Batch<Time = ()>,
         Z::InnerBatch: Send,
@@ -73,11 +96,40 @@ impl Catalog {
                 .get(&name.name())
                 .copied()
                 .unwrap_or_default();
-            stream.shard_workers(hosts[ordinal].workers.clone())
+
+            let (accumulated_stream, enabled_count) = stream
+                .shard_workers_accumulate(hosts[ordinal].workers.clone())
+                .into_parts();
+
+            let integral = if integrate {
+                Some(
+                    stream.shard_workers_accumulate_integrate_trace(hosts[ordinal].workers.clone()),
+                )
+            } else {
+                None
+            };
+
+            (accumulated_stream, enabled_count, integral)
         } else if shard {
-            stream.shard()
+            let (accumulated_stream, enabled_count) = stream.shard_accumulate().into_parts();
+
+            let integral = if integrate {
+                // Avoid bootstrapping when upgrading from an older Feldera version using shard().accumulate().
+                Some(stream.shard_accumulate_integrate_trace_legacy())
+            } else {
+                None
+            };
+
+            (accumulated_stream, enabled_count, integral)
         } else {
-            stream.clone()
+            let (accumulated_stream, enabled_count) = stream.accumulate().into_parts();
+            let integral = if integrate {
+                Some(stream.accumulate_integrate_trace())
+            } else {
+                None
+            };
+
+            (accumulated_stream, enabled_count, integral)
         }
     }
 
@@ -421,6 +473,7 @@ impl Catalog {
         Z::Key: Sync + From<D>,
     {
         let name = schema.name.clone();
+        let circuit = stream.circuit();
 
         if name == SqlIdentifier::new(INTERNED_STRING_RELATION_NAME, false) {
             if TypeId::of::<Z>() != TypeId::of::<OrdZSet<Tup1<SqlString>>>() {
@@ -438,12 +491,12 @@ impl Catalog {
             }
         }
 
-        let stream = self.gather_output_to_host(&name, &stream, false);
+        let (stream, enable_count, _) = self.gather_output_to_host(&name, &stream, false, false);
 
         // Create handle for the stream itself.
-        let (delta_handle, enable_count, delta_gid) =
-            stream.accumulate_output_persistent_with_gid(persistent_id);
-        stream.circuit().set_mir_node_id(&delta_gid, persistent_id);
+        let (delta_handle, delta_gid) =
+            circuit.output_accumulated_stream_persistent_with_gid::<Z>(&stream, persistent_id);
+        circuit.set_mir_node_id(&delta_gid, persistent_id);
 
         let handles = OutputCollectionHandles {
             key_schema: None,
@@ -538,6 +591,7 @@ impl Catalog {
         Z::Key: Sync + From<D>,
     {
         let name = schema.name.clone();
+        let circuit = stream.circuit();
 
         // The integral of this stream is used by the ad hoc query
         // engine. The engine treats the integral computed by each
@@ -548,17 +602,16 @@ impl Catalog {
         // same record with +1 and -1 weights in different workers.
         // To avoid this, we shard the stream, so that such records
         // get canceled out.
-        let gathered_stream = self.gather_output_to_host(&name, &stream, true);
+        let (gathered_stream, enable_count, gathered_integral_stream) =
+            self.gather_output_to_host(&name, &stream, true, gather_integral);
 
         // Create handle for the stream itself.
-        let (delta_handle, enable_count, delta_gid) =
-            gathered_stream.accumulate_output_persistent_with_gid(persistent_id);
-        gathered_stream
-            .circuit()
-            .set_mir_node_id(&delta_gid, persistent_id);
+        let (delta_handle, delta_gid) = circuit
+            .output_accumulated_stream_persistent_with_gid::<Z>(&gathered_stream, persistent_id);
+        circuit.set_mir_node_id(&delta_gid, persistent_id);
 
-        let integral_stream = if gather_integral {
-            gathered_stream.accumulate_integrate_trace()
+        let integral_stream = if let Some(gathered_integral_stream) = gathered_integral_stream {
+            gathered_integral_stream
         } else {
             stream.accumulate_integrate_trace()
         };
@@ -568,9 +621,8 @@ impl Catalog {
             .output_persistent_with_gid(
                 persistent_id.map(|id| format!("{id}.integral")).as_deref(),
             );
-        gathered_stream
-            .circuit()
-            .set_mir_node_id(&integrate_gid, persistent_id);
+
+        circuit.set_mir_node_id(&integrate_gid, persistent_id);
 
         let handles = OutputCollectionHandles {
             key_schema: None,
@@ -723,38 +775,43 @@ impl Catalog {
         V: DBData + Send + Sync + From<VD> + Default,
     {
         let name = schema.name.clone();
+        let circuit = stream.circuit();
 
         let stream = stream.try_sharded_version();
 
         // Shard the stream if it needs to be materialized.
-        let gathered_stream =
-            self.gather_output_to_host(&name, &stream, materialized && accumulate);
+        let (gathered_stream, enable_count, gathered_integral_stream) = self.gather_output_to_host(
+            &name,
+            &stream,
+            materialized && accumulate,
+            materialized && accumulate,
+        );
 
-        let (delta_handle, enable_count, delta_gid) =
-            gathered_stream.accumulate_output_persistent_with_gid(persistent_id);
-        gathered_stream
-            .circuit()
-            .set_mir_node_id(&delta_gid, persistent_id);
+        let (delta_handle, delta_gid) = circuit
+            .output_accumulated_stream_persistent_with_gid::<OrdIndexedZSet<K, V>>(
+                &gathered_stream,
+                persistent_id,
+            );
+        circuit.set_mir_node_id(&delta_gid, persistent_id);
 
         let integrate_handle = if materialized {
-            let (integrate_handle, integral_gid) = if accumulate {
-                gathered_stream.accumulate_integrate_trace()
-            } else {
-                // This is an integral of an input table with a primary key. We don't support sending a snapshot
-                // of table to a connector, so we don't need to use the gathered stream.
-                // `integrate_trace` should return the existing integral created by the InputUpsert operator.
-                stream.shard().integrate_trace()
-            }
-            .apply(|s| TypedBatch::<K, V, ZWeight, _>::new(s.inner().ro_snapshot()))
-            .output_persistent_with_gid(
-                persistent_id
-                    .map(|id| format!("{id}.output_integral"))
-                    .as_deref(),
-            );
+            let (integrate_handle, integral_gid) =
+                if let Some(gathered_integral_stream) = gathered_integral_stream {
+                    gathered_integral_stream
+                } else {
+                    // This is an integral of an input table with a primary key. We don't support sending a snapshot
+                    // of table to a connector, so we don't need to use the gathered stream.
+                    // `integrate_trace` should return the existing integral created by the InputUpsert operator.
+                    stream.shard().integrate_trace()
+                }
+                .apply(|s| TypedBatch::<K, V, ZWeight, _>::new(s.inner().ro_snapshot()))
+                .output_persistent_with_gid(
+                    persistent_id
+                        .map(|id| format!("{id}.output_integral"))
+                        .as_deref(),
+                );
 
-            gathered_stream
-                .circuit()
-                .set_mir_node_id(&integral_gid, persistent_id);
+            circuit.set_mir_node_id(&integral_gid, persistent_id);
             Some(
                 Arc::new(<SerCollectionHandleImpl<_, KD, VD>>::new(integrate_handle))
                     as Arc<dyn SerBatchReaderHandle>,
@@ -980,7 +1037,7 @@ fn index_schema(
 
 #[cfg(test)]
 mod test {
-    use std::{io::Write, ops::Deref, sync::atomic::Ordering};
+    use std::{io::Write, ops::Deref};
 
     use crate::{Catalog, CircuitCatalog, catalog::RecordFormat, test::TestStruct};
     use dbsp::Runtime;
@@ -1042,9 +1099,7 @@ mod test {
             .unwrap();
 
         let output_stream_handles = catalog.output_handles(&("Input_map".into())).unwrap();
-        output_stream_handles
-            .enable_count
-            .fetch_add(1, Ordering::AcqRel);
+        output_stream_handles.enable_count.enable();
 
         // Step 1: insert a couple of values.
 

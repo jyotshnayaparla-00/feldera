@@ -170,7 +170,7 @@ Live stream of updates to the view can be observed using the following `curl`
 command:
 
 ```sh
-curl -i -X 'POST' http://127.0.0.1:8080/v0/pipelines/batch/egress/q2?format=json
+curl -i -X 'POST' 'http://127.0.0.1:8080/v0/pipelines/batch/egress/q2?format=json'
 ```
 
 As the contents of the view change, the changes will be

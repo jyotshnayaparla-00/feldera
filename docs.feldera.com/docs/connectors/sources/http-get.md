@@ -49,7 +49,7 @@ WITH ('connectors' = '[{
 ### curl
 
 ```bash
-curl -i -X PUT http://127.0.0.1:8080/v0/pipelines/workshop \
+curl -i -X PUT 'http://127.0.0.1:8080/v0/pipelines/workshop' \
 -H 'Content-Type: application/json' \
 -d "$(jq -Rsn \
   --rawfile code program.sql \

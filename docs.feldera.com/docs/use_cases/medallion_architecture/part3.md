@@ -7,7 +7,7 @@ The batch job is provided as a Databricks notebook:
 - [`spark_notebook.py`](https://github.com/feldera/feldera/blob/main/docs.feldera.com/docs/use_cases/medallion_architecture/spark_notebook.py) — *Compute Silver & Gold Delta Tables — Spark Batch*
 
 ```bash
-curl -O https://raw.githubusercontent.com/feldera/feldera/main/docs.feldera.com/docs/use_cases/medallion_architecture/spark_notebook.py
+curl -O 'https://raw.githubusercontent.com/feldera/feldera/main/docs.feldera.com/docs/use_cases/medallion_architecture/spark_notebook.py'
 ```
 
 Import it into Databricks (or any Spark 3.x environment with Delta Lake), or run it as a plain PySpark script — outside Databricks you'll need the `delta-spark` and `hadoop-aws` packages configured, and the `# COMMAND` / `# MAGIC` lines are just comments. It reads the same Bronze snapshot from `s3://feldera-demos/ecommerce-cdc-0-01/snapshot` and produces the **same 8 Silver and 7 Gold tables** as the SQL pipeline.

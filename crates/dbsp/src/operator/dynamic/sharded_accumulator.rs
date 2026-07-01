@@ -30,14 +30,17 @@ use crate::{
         communication::{
             ExchangeClients, ExchangeDelivery, ExchangeDirectory, ExchangeId, pop_flushed,
         },
-        dynamic::shard_batch,
+        dynamic::{
+            accumulator::{Accumulation, EnableCount},
+            shard_batch,
+        },
     },
     trace::{Batch, BatchReader as _, Spine, Trace, deserialize_indexed_wset},
 };
 
 circuit_cache_key!(local StreamingExchangeCacheId<B: Batch>(ExchangeId => Arc<ShardedAccumulator<B>>));
 
-circuit_cache_key!(ShardedAccumulatorId<C, B: Batch>(StreamId => Stream<C, Option<Spine<B>>>));
+circuit_cache_key!(ShardedAccumulatorId<C, B: Batch>(StreamId => Accumulation<Stream<C, Option<Spine<B>>>>));
 
 impl<C, B> Stream<C, B>
 where
@@ -47,7 +50,10 @@ where
     /// Implements a fused shard-accumulator operation, equivalent to
     /// `self.dyn_shard().dyn_accumulate()` but intended to be more efficient.
     #[track_caller]
-    pub fn dyn_shard_accumulate(&self, factories: &B::Factories) -> Stream<C, Option<Spine<B>>>
+    pub fn dyn_shard_accumulate(
+        &self,
+        factories: &B::Factories,
+    ) -> Accumulation<Stream<C, Option<Spine<B>>>>
     where
         B: Batch<Time = ()>,
     {
@@ -71,7 +77,9 @@ where
                                 exchange_id,
                                 factories,
                             );
-                            self.circuit()
+                            let enable_count = exchange.enable_count.clone();
+                            let stream = self
+                                .circuit()
                                 .add_exchange(
                                     ShardedAccumulatorSender::new(
                                         Some(Location::caller()),
@@ -83,12 +91,37 @@ where
                                     ),
                                     self,
                                 )
-                                .mark_sharded()
+                                .mark_sharded();
+                            Accumulation {
+                                stream,
+                                enable_count,
+                            }
                         }
                         StepSize::FullSteps => self.dyn_shard(factories).dyn_accumulate(factories),
                     }
                 })
                 .clone()
+        }
+    }
+
+    #[track_caller]
+    pub fn dyn_shard_workers_accumulate(
+        &self,
+        factories: &B::Factories,
+        workers: Range<usize>,
+    ) -> Accumulation<Stream<C, Option<Spine<B>>>>
+    where
+        B: Batch<Time = ()>,
+    {
+        if Runtime::num_workers() == 1 {
+            self.dyn_accumulate(factories)
+        } else if Runtime::with_dev_tweaks(|d| !d.streaming_exchange()) {
+            self.dyn_shard_workers(workers, factories)
+                .dyn_accumulate(factories)
+        } else {
+            // TODO: implement using streaming exchange.
+            self.dyn_shard_workers(workers, factories)
+                .dyn_accumulate(factories)
         }
     }
 }
@@ -112,6 +145,8 @@ where
     clients: Arc<ExchangeClients>,
 
     rxq: Vec<Mutex<Rxq<B>>>,
+
+    enable_count: EnableCount,
 }
 
 impl<B> ShardedAccumulator<B>
@@ -179,6 +214,7 @@ where
                 })
                 .collect(),
             name,
+            enable_count: EnableCount::default(),
         });
 
         directory.insert(exchange_id, exchange.clone());
@@ -501,7 +537,15 @@ where
     name: OperatorName,
     exchange: Arc<ShardedAccumulator<B>>,
 
-    // Input batch sizes.
+    /// Whether the accumulator is enabled during the current transaction.
+    ///
+    /// An output connector can be attached in the middle of a transaction; however if the
+    /// accumulator was disabled at the start of the transaction, it shouldn't produce
+    /// partial outputs. This flag remembers the status of the accumulator at the start of the
+    /// transaction.
+    enabled_during_current_transaction: Option<bool>,
+
+    /// Input batch sizes.
     input_batch_stats: BatchSizeStats,
 
     flushed: bool,
@@ -516,6 +560,7 @@ where
             location,
             name: OperatorName::new("ShardedAccumulatorSender"),
             exchange,
+            enabled_during_current_transaction: None,
             input_batch_stats: BatchSizeStats::new(),
             flushed: false,
         }
@@ -556,20 +601,52 @@ where
     }
 }
 
+impl<B> ShardedAccumulatorSender<B>
+where
+    B: Batch<Time = ()>,
+{
+    async fn eval_inner<'a>(&mut self, batch: Cow<'a, B>) {
+        // We don't have a start-of-transaction signal, so we sample enable_count when
+        // we get the first non-empty batch.  This batch should belong to the next transaction
+        // after the last one that was flushed, since the accumulator should not receive any
+        // non-empty batches from the previous transaction at that point (in the top-level circuit).
+        // This may not be the first batch in the transaction, but it's ok to admit some empty batches.
+        let len = batch.len();
+        if (len > 0 || self.flushed) && self.enabled_during_current_transaction.is_none() {
+            self.enabled_during_current_transaction = Some(self.exchange.enable_count.is_enabled());
+        }
+        let Some(enabled) = self.enabled_during_current_transaction else {
+            return;
+        };
+
+        if enabled {
+            self.input_batch_stats.add_batch(len);
+            self.exchange
+                .send(self.name.get(), batch.into_owned(), self.flushed)
+                .await;
+        }
+
+        if self.flushed {
+            if !enabled {
+                let batch = B::dyn_empty(&self.exchange.factories);
+                self.exchange.send(self.name.get(), batch, true).await;
+            }
+            self.flushed = false;
+            self.enabled_during_current_transaction = None;
+        }
+    }
+}
+
 impl<B> SinkOperator<B> for ShardedAccumulatorSender<B>
 where
     B: Batch<Time = ()>,
 {
     async fn eval(&mut self, batch: &B) {
-        self.eval_owned(batch.clone()).await
+        self.eval_inner(Cow::Borrowed(batch)).await
     }
 
     async fn eval_owned(&mut self, batch: B) {
-        self.input_batch_stats.add_batch(batch.num_entries_deep());
-        self.exchange
-            .send(self.name.get(), batch, self.flushed)
-            .await;
-        self.flushed = false;
+        self.eval_inner(Cow::Owned(batch)).await
     }
 
     fn input_preference(&self) -> OwnershipPreference {
@@ -828,7 +905,10 @@ mod tests {
         >,
     )> {
         let (input, input_handle) = circuit.add_input_zset::<usize>();
-        let output_handle = input.shard_accumulate().latest_output();
+        let output_handle = input
+            .shard_accumulate()
+            .into_enabled_stream()
+            .latest_output();
         Ok((input_handle, output_handle))
     }
 
